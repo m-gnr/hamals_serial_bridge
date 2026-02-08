@@ -74,7 +74,7 @@ class SerialBridgeNode(Node):
 
         self.odom_pub = self.create_publisher(
             Odometry,
-            '/odom',
+            '/odom_raw',
             10
         )
 
