@@ -3,5 +3,5 @@ serial:
   baudrate: 115200
   timeout_ms: 50
 
-loop_rate_hz: 100
+rate_hz: 100
 publish_tf: false

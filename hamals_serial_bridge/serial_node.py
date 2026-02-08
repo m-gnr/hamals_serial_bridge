@@ -15,27 +15,38 @@ from .protocol import encode_cmd
 from .parser import LineParser
 
 
+# ------------------------------------------------------
+# Utils
+# ------------------------------------------------------
 def yaw_to_quat(yaw: float):
-    """Yaw (rad) → quaternion"""
+    """
+    Yaw (rad) → quaternion
+    Planar robot: roll = pitch = 0
+    """
     qz = math.sin(yaw * 0.5)
     qw = math.cos(yaw * 0.5)
     return (0.0, 0.0, qz, qw)
 
 
+# ======================================================
+# SERIAL BRIDGE NODE
+# ======================================================
 class SerialBridgeNode(Node):
     def __init__(self):
         super().__init__('hamals_serial_bridge')
 
         # -------------------- PARAMETERS --------------------
-        self.declare_parameter('port', '/dev/ttyUSB0')
-        self.declare_parameter('baudrate', 115200)
+        self.declare_parameter('serial.port', '/dev/ttyUSB0')
+        self.declare_parameter('serial.baudrate', 115200)
+        self.declare_parameter('serial.timeout_ms', 100)
         self.declare_parameter('rate_hz', 50)
-        self.declare_parameter('timeout_ms', 100)
+        self.declare_parameter('publish_tf', False)
 
-        self.port       = self.get_parameter('port').value
-        self.baudrate   = self.get_parameter('baudrate').value
+        self.port       = self.get_parameter('serial.port').value
+        self.baudrate   = self.get_parameter('serial.baudrate').value
+        self.timeout_ms = self.get_parameter('serial.timeout_ms').value
         self.rate_hz    = self.get_parameter('rate_hz').value
-        self.timeout_ms = self.get_parameter('timeout_ms').value
+        self.publish_tf = self.get_parameter('publish_tf').value
 
         # -------------------- SERIAL -----------------------
         try:
@@ -53,7 +64,7 @@ class SerialBridgeNode(Node):
 
         self.parser = LineParser()
 
-        # -------------------- ROS --------------------------
+        # -------------------- ROS INTERFACES ----------------
         self.cmd_sub = self.create_subscription(
             Twist,
             '/cmd_vel',
@@ -67,19 +78,22 @@ class SerialBridgeNode(Node):
             10
         )
 
-        # -------------------- THREAD -----------------------
+        # -------------------- RX THREAD ---------------------
         self._rx_thread = threading.Thread(
             target=self.serial_rx_loop,
             daemon=True
         )
         self._rx_thread.start()
 
-        self.get_logger().info("hamals_serial_bridge started")
+        self.get_logger().info("hamals_serial_bridge node started")
 
     # ======================================================
     # ROS → MCU
     # ======================================================
     def cmd_vel_callback(self, msg: Twist):
+        """
+        /cmd_vel → MCU
+        """
         v = msg.linear.x
         w = msg.angular.z
 
@@ -94,6 +108,9 @@ class SerialBridgeNode(Node):
     # MCU → ROS
     # ======================================================
     def serial_rx_loop(self):
+        """
+        Read raw serial bytes, feed parser, publish decoded messages.
+        """
         while rclpy.ok():
             try:
                 raw = self.ser.read(128)
@@ -101,9 +118,9 @@ class SerialBridgeNode(Node):
                     continue
 
                 decoded = raw.decode('utf-8', errors='ignore')
-                msg = self.parser.feed(decoded)
+                messages = self.parser.push(decoded)
 
-                if msg:
+                for msg in messages:
                     self.handle_serial_message(msg)
 
             except Exception as e:
@@ -111,7 +128,19 @@ class SerialBridgeNode(Node):
                 time.sleep(0.1)
 
     def handle_serial_message(self, msg: dict):
-        if msg['type'] != 'odom':
+        """
+        Handle decoded MCU message.
+        Expected:
+        {
+            'type': 'odom',
+            'x': ...,
+            'y': ...,
+            'yaw': ...,
+            'v': ...,
+            'w': ...
+        }
+        """
+        if msg.get('type') != 'odom':
             return
 
         odom = Odometry()
@@ -123,7 +152,7 @@ class SerialBridgeNode(Node):
         odom.pose.pose.position.x = msg['x']
         odom.pose.pose.position.y = msg['y']
 
-        # Orientation
+        # Orientation (yaw only)
         qx, qy, qz, qw = yaw_to_quat(msg['yaw'])
         odom.pose.pose.orientation.x = qx
         odom.pose.pose.orientation.y = qy
@@ -137,9 +166,14 @@ class SerialBridgeNode(Node):
         self.odom_pub.publish(odom)
 
 
+# ======================================================
+# MAIN
+# ======================================================
 def main(args=None):
     rclpy.init(args=args)
+
     node = SerialBridgeNode()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
