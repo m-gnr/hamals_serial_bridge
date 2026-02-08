@@ -1,58 +1,49 @@
 # hamals_serial_bridge/protocol.py
 
-from typing import Optional, Dict
-
-
 # ======================================================
 # ROS → MCU
 # ======================================================
 def encode_cmd(v: float, w: float) -> str:
     """
-    Encode velocity command for MCU.
+    Encode cmd_vel to MCU protocol.
 
-    Format:
-        CMD,v,w\n
+    Output:
+      CMD v w\n
     """
-    return f"CMD,{v:.4f},{w:.4f}\n"
+    return f"CMD {v:.3f} {w:.3f}\n"
 
 
 # ======================================================
 # MCU → ROS
 # ======================================================
-def decode_line(line: str) -> Optional[Dict]:
+def decode_line(line: str):
     """
-    Decode a single line received from MCU.
+    Decode a single protocol line.
 
-    Expected formats:
-        ODOM,x,y,yaw,v,w
-
-    Returns:
-        dict or None
+    Expected:
+      odom,x,y,yaw,v,w
     """
+
     if not line:
         return None
 
-    parts = line.split(',')
-    if len(parts) == 0:
+    line = line.strip()
+
+    if not line.lower().startswith("odom,"):
         return None
 
-    msg_type = parts[0]
+    parts = line.split(',')
+    if len(parts) != 6:
+        return None
 
-    # --------------------
-    # ODOMETRY
-    # --------------------
-    if msg_type == 'ODOM' and len(parts) == 6:
-        try:
-            return {
-                'type': 'odom',
-                'x':   float(parts[1]),
-                'y':   float(parts[2]),
-                'yaw': float(parts[3]),
-                'v':   float(parts[4]),
-                'w':   float(parts[5]),
-            }
-        except ValueError:
-            return None
-
-    # UNKNOWN
-    return None
+    try:
+        return {
+            "type": "odom",
+            "x": float(parts[1]),
+            "y": float(parts[2]),
+            "yaw": float(parts[3]),
+            "v": float(parts[4]),
+            "w": float(parts[5]),
+        }
+    except ValueError:
+        return None

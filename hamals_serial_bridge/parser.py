@@ -18,15 +18,6 @@ class LineParser:
         self._buffer = ""
 
     def push(self, data: str) -> List[Dict]:
-        """
-        Push raw serial data.
-
-        Args:
-            data (str): Raw string from serial (may be partial)
-
-        Returns:
-            List[dict]: Decoded protocol messages
-        """
         messages: List[Dict] = []
 
         if not data:
@@ -48,7 +39,4 @@ class LineParser:
         return messages
 
     def reset(self):
-        """
-        Clear internal buffer.
-        """
         self._buffer = ""

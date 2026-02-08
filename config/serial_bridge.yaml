@@ -1,7 +1,6 @@
-serial:
-  port: /dev/ttyUSB0
-  baudrate: 115200
-  timeout_ms: 50
-
-rate_hz: 100
-publish_tf: false
+hamals_serial_bridge:
+  ros__parameters:
+    port: /dev/ttyACM0
+    baudrate: 115200
+    timeout_ms: 50
+    rate_hz: 50

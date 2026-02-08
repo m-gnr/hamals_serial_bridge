@@ -36,15 +36,15 @@ class SerialBridgeNode(Node):
         super().__init__('hamals_serial_bridge')
 
         # -------------------- PARAMETERS --------------------
-        self.declare_parameter('serial.port', '/dev/ttyUSB0')
-        self.declare_parameter('serial.baudrate', 115200)
-        self.declare_parameter('serial.timeout_ms', 100)
+        self.declare_parameter('port', '/dev/ttyACM0')
+        self.declare_parameter('baudrate', 115200)
+        self.declare_parameter('timeout_ms', 50)
         self.declare_parameter('rate_hz', 50)
         self.declare_parameter('publish_tf', False)
 
-        self.port       = self.get_parameter('serial.port').value
-        self.baudrate   = self.get_parameter('serial.baudrate').value
-        self.timeout_ms = self.get_parameter('serial.timeout_ms').value
+        self.port       = self.get_parameter('port').value
+        self.baudrate   = self.get_parameter('baudrate').value
+        self.timeout_ms = self.get_parameter('timeout_ms').value
         self.rate_hz    = self.get_parameter('rate_hz').value
         self.publish_tf = self.get_parameter('publish_tf').value
 
