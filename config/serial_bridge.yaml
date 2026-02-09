@@ -1,4 +1,4 @@
-hamals_serial_bridge:
+/**:
   ros__parameters:
     port: /dev/ttyACM0
     baudrate: 115200
@@ -11,3 +11,10 @@ hamals_serial_bridge:
     reset_on_startup: true
     reset_pulse_ms: 100
     reset_boot_wait_ms: 1500
+
+    debug_rx: false
+    debug_tx: false
+    debug_odom: false
+    debug_deadman: false
+
+    cmd_vel_timeout_ms: 500
