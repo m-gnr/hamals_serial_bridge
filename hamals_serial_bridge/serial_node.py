@@ -9,23 +9,10 @@ from nav_msgs.msg import Odometry
 import serial
 import threading
 import time
-import math
 
 from .protocol import encode_cmd
 from .parser import LineParser
-
-
-# ------------------------------------------------------
-# Utils
-# ------------------------------------------------------
-def yaw_to_quat(yaw: float):
-    """
-    Yaw (rad) → quaternion
-    Planar robot: roll = pitch = 0
-    """
-    qz = math.sin(yaw * 0.5)
-    qw = math.cos(yaw * 0.5)
-    return (0.0, 0.0, qz, qw)
+from .utils import yaw_to_quat
 
 
 # ======================================================
@@ -36,45 +23,56 @@ class SerialBridgeNode(Node):
         super().__init__('hamals_serial_bridge')
 
         # -------------------- PARAMETERS --------------------
-        self.declare_parameter('port', '/dev/ttyACM0')
-        self.declare_parameter('baudrate', 115200)
+        # REQUIRED
+        self.declare_parameter('port')
+        self.declare_parameter('baudrate')
+        self.declare_parameter('cmd_vel_topic')
+        self.declare_parameter('odom_topic')
+
+        # OPTIONAL
         self.declare_parameter('timeout_ms', 50)
-        self.declare_parameter('rate_hz', 50)
-        self.declare_parameter('publish_tf', False)
+        self.declare_parameter('odom_pub_hz', 50)
 
-        self.port       = self.get_parameter('port').value
-        self.baudrate   = self.get_parameter('baudrate').value
+        self.declare_parameter('reset_on_startup', True)
+        self.declare_parameter('reset_pulse_ms', 100)
+        self.declare_parameter('reset_boot_wait_ms', 1500)
+
+        # -------------------- REQUIRED PARAM CHECK --------------------
+        self.port = self._get_required_param('port')
+        self.baudrate = self._get_required_param('baudrate')
+        self.cmd_vel_topic = self._get_required_param('cmd_vel_topic')
+        self.odom_topic = self._get_required_param('odom_topic')
+
+        # -------------------- OPTIONAL PARAMS --------------------
         self.timeout_ms = self.get_parameter('timeout_ms').value
-        self.rate_hz    = self.get_parameter('rate_hz').value
-        self.publish_tf = self.get_parameter('publish_tf').value
+        self.odom_pub_hz = self.get_parameter('odom_pub_hz').value
 
-        # -------------------- SERIAL -----------------------
-        try:
-            self.ser = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                timeout=self.timeout_ms / 1000.0
-            )
-            self.get_logger().info(
-                f"Serial connected: {self.port} @ {self.baudrate}"
-            )
-        except Exception as e:
-            self.get_logger().fatal(f"Serial open failed: {e}")
-            raise
+        self.reset_on_startup   = self.get_parameter('reset_on_startup').value
+        self.reset_pulse_ms     = self.get_parameter('reset_pulse_ms').value
+        self.reset_boot_wait_ms = self.get_parameter('reset_boot_wait_ms').value
+
+        # odom publish rate control
+        self._odom_pub_period = 1.0 / float(self.odom_pub_hz)
+        self._last_odom_pub_time = 0.0
+
+        # -------------------- SERIAL SETUP --------------------
+        self.ser = None
+        self._connect_serial()
+        self._reset_mcu()
 
         self.parser = LineParser()
 
         # -------------------- ROS INTERFACES ----------------
         self.cmd_sub = self.create_subscription(
             Twist,
-            '/cmd_vel',
+            self.cmd_vel_topic,
             self.cmd_vel_callback,
             10
         )
 
         self.odom_pub = self.create_publisher(
             Odometry,
-            '/odom_raw',
+            self.odom_topic,
             10
         )
 
@@ -88,12 +86,50 @@ class SerialBridgeNode(Node):
         self.get_logger().info("hamals_serial_bridge node started")
 
     # ======================================================
+    # REQUIRED PARAM HELPER
+    # ======================================================
+    def _get_required_param(self, name: str):
+        param = self.get_parameter(name)
+        if param.type_ == param.Type.NOT_SET:
+            raise RuntimeError(f"Missing required parameter: {name}")
+        return param.value
+
+    # ======================================================
+    # SERIAL / MCU CONTROL
+    # ======================================================
+    def _connect_serial(self):
+        """Serial port bağlantısını kur"""
+        try:
+            self.ser = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=self.timeout_ms / 1000.0
+            )
+            self.get_logger().info(
+                f"Serial connected: {self.port} @ {self.baudrate}"
+            )
+        except Exception as e:
+            self.get_logger().fatal(f"Serial open failed: {e}")
+            raise
+
+    def _reset_mcu(self):
+        """MCU'yu DTR üzerinden resetle"""
+        if not self.reset_on_startup or self.ser is None:
+            return
+
+        try:
+            self.get_logger().info("Resetting MCU via DTR")
+            self.ser.dtr = False
+            time.sleep(self.reset_pulse_ms / 1000.0)
+            self.ser.dtr = True
+            time.sleep(self.reset_boot_wait_ms / 1000.0)
+        except Exception as e:
+            self.get_logger().warn(f"MCU reset failed: {e}")
+
+    # ======================================================
     # ROS → MCU
     # ======================================================
     def cmd_vel_callback(self, msg: Twist):
-        """
-        /cmd_vel → MCU
-        """
         v = msg.linear.x
         w = msg.angular.z
 
@@ -108,9 +144,6 @@ class SerialBridgeNode(Node):
     # MCU → ROS
     # ======================================================
     def serial_rx_loop(self):
-        """
-        Read raw serial bytes, feed parser, publish decoded messages.
-        """
         while rclpy.ok():
             try:
                 raw = self.ser.read(128)
@@ -128,38 +161,35 @@ class SerialBridgeNode(Node):
                 time.sleep(0.1)
 
     def handle_serial_message(self, msg: dict):
-        """
-        Handle decoded MCU message.
-        Expected:
-        {
-            'type': 'odom',
-            'x': ...,
-            'y': ...,
-            'yaw': ...,
-            'v': ...,
-            'w': ...
-        }
-        """
         if msg.get('type') != 'odom':
             return
 
+        now = time.time()
+        if now - self._last_odom_pub_time < self._odom_pub_period:
+            return
+        self._last_odom_pub_time = now
+
+        self._publish_odom(msg)
+
+    # ======================================================
+    # ODOM PUBLISH
+    # ======================================================
+    def _publish_odom(self, msg: dict):
+        """Odometry mesajını yayınla"""
         odom = Odometry()
         odom.header.stamp = self.get_clock().now().to_msg()
         odom.header.frame_id = 'odom'
         odom.child_frame_id = 'base_link'
 
-        # Position
         odom.pose.pose.position.x = msg['x']
         odom.pose.pose.position.y = msg['y']
 
-        # Orientation (yaw only)
         qx, qy, qz, qw = yaw_to_quat(msg['yaw'])
         odom.pose.pose.orientation.x = qx
         odom.pose.pose.orientation.y = qy
         odom.pose.pose.orientation.z = qz
         odom.pose.pose.orientation.w = qw
 
-        # Velocity
         odom.twist.twist.linear.x = msg['v']
         odom.twist.twist.angular.z = msg['w']
 
