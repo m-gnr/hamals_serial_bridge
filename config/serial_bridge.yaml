@@ -12,9 +12,5 @@
     reset_pulse_ms: 100
     reset_boot_wait_ms: 1500
 
-    debug_rx: false
-    debug_tx: false
-    debug_odom: false
-    debug_deadman: false
-
+    debug: true
     cmd_vel_timeout_ms: 500
