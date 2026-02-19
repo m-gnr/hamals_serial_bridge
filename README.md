@@ -1,6 +1,6 @@
 # HAMALS Serial Bridge
 
-> ROS 2 ile gömülü MCU firmware arasında güvenli ve katmanlı seri haberleşme köprüsü.
+> ROS2 ile gömülü MCU firmware arasında güvenli ve katmanlı seri haberleşme köprüsü.
 > 
 
 hamals_serial_bridge, diferansiyel sürüşlü mobil robotlarda ROS 2 ekosistemi ile mikrodenetleyici firmware’i arasında kontrollü ve güvenli bağlantı sağlayan modüler bir middleware katmanıdır.
@@ -11,7 +11,7 @@ Bu paket iki farklı dünyayı birbirine bağlar
 
 ### ROS 2 Tarafı
 
-- Nav2
+- NAV2
 - Teleop
 - EKF / robot_localization
 - RViz
@@ -22,18 +22,19 @@ Bu paket iki farklı dünyayı birbirine bağlar
 - Encoder ISR
 - IMU polling
 - PID kontrol
-- odometri hesaplama
+- Odometry hesaplama
+- Watchdog fail-safe
 
-hamals_serial_bridge, ROS 2 ile firmware arasında güvenli bir sistem sınırı (system boundary) oluşturur ve veri akışını kontrollü şekilde yönetir.
+Serial bridge, ROS ile firmware arasında **system boundary** oluşturur ve veri akışını doğrulamalı (checksum’lu) şekilde yönetir.
 
-## Mimari
+# Mimari
 
-```text
+```
 [ ROS Graph Layer ]
         |
-[ Bridge Orchestrator (serial_node) ]
+[ SerialBridge Node ]
         |
-[ Transport & Protocol Layer ]
+[ Framed Protocol Layer ]
         |
 [ Embedded Firmware ]
 ```
@@ -43,30 +44,33 @@ hamals_serial_bridge, ROS 2 ile firmware arasında güvenli bir sistem sınırı
 - Tek sorumluluk prensibi
 - Katmanlı mimari
 - Config-driven yapı
+- Thread-safe TX (lock korumalı)
+- Framed + checksum’lu protokol
 - Dead-man güvenlik mekanizması
-- Thread izolasyonu
+- Parser istatistikleri
+- Nav2 uyumlu covariance
 
 ## Veri Akışı
 
 ### **ROS → MCU**
 
-```text
-Twist → encode_cmd() → serial.write()
+```
+Twist → encode_cmd() → framed packet → serial.write()
 ```
 
 /cmd_vel mesajı MCU protokolüne çevirerek seri hat üzerinden gönderilir.
 
 ### MCU → ROS
 
-```text
-serial.read → parser.push() → decode_line() → publish(Odometry)
+```
+serial.read → LineParser → checksum verify → publish(Odometry)
 ```
 
-MCU’dan gelen odometri verisi ayrıştırılır ve ROS nav_msgs/Odometry mesajına dönüştürülür.
+MCU’dan gelen odometri verisi ayrıştırılır ve ROS nav_msg /Odometry mesajına dönüştürülür.
 
 ## Paket Yapısı
 
-```python
+```
 hamals_serial_bridge/
 ├── config/serial_bridge.yaml
 ├── hamals_serial_bridge/
@@ -81,8 +85,8 @@ hamals_serial_bridge/
 ## Konfigürasyon
 
 ```yaml
-/**:
   ros__parameters:
+
     port: /dev/ttyACM0
     baudrate: 115200
     timeout_ms: 50
@@ -91,7 +95,16 @@ hamals_serial_bridge/
     odom_topic: /odom
     odom_pub_hz: 50
 
+    frame_id: odom
+    child_frame_id: base_link
+
+    pose_covariance: [ ... 36 elements ... ]
+    twist_covariance: [ ... 36 elements ... ]
+
     reset_on_startup: true
+    reset_pulse_ms: 100
+    reset_boot_wait_ms: 1500
+
     cmd_vel_timeout_ms: 500
     debug: true
 ```
@@ -100,59 +113,64 @@ hamals_serial_bridge/
 
 Belirli süre içinde /cmd_vel alınmazsa:
 
-```text
+```yaml
 CMD 0.000 0.000
 ```
 
 gönderilir ve robot durdurulur.
 
-Bu sayede kontrolsüz hareket (runaway) durumu engellenir.
+Bu durumlarda runaway robotr engellenir.
 
 - WiFi kopması
 - Teleop çökmesi
 - Nav2 hatası
 - Node kapanması
 
-## Thread Modeli
-
-- ROS callback’leri ana thread’de çalışır
-- Serial RX ayrı daemon thread’dedir
-- Bloklayıcı okuma ROS tarafını kilitlemez
-
-## Seri Protokol
+## Framed Seri Protokol
 
 **ROS → MCU**
 
-```text
-CMD <linear_velocity> <angular_velocity>\n
+```yaml
+CMD <linear_velocity> <angular_velocity>
 ```
 
 Örnek:
 
-```text
-CMD 0.200 0.000
+```
+$CMD,0.200,0.000*5A
 ```
 
 ### MCU → ROS
 
-```text
+```yaml
 odom,x,y,yaw,v,w
 ```
 
 Örnek:
 
-```text
-odom,1.23,0.45,0.12,0.20,0.00
 ```
+$ODOM,1.23,0.45,0.12,0.20,0.00*3F
+```
+
+Invalid checksum türünde frame’ler parser tarafından discard edilir.
+
+## Thread Modeli
+
+- ROS callback ana thread
+- Serial RX ayrı daemon thread
+- TX lock ile thread-safe write
+- Parser realign + framed recovery
 
 ## Debug Modu
 
 debug: true ise:
 
-- RX paket sayısı
-- TX paket sayısı
-- Yayınlanan odom sayısı
-- Dead-man durumu
+- RX bytes
+- RX valid frames
+- RX invalid frames
+- TX packets
+- Odom publish count
+- Dead-man state
 - Son cmd_vel
 - Son odom
 
@@ -162,13 +180,36 @@ debug: true ise:
 
 Build:
 
-```text
+```yaml
 colcon build --packages-select hamals_serial_bridge
 source install/setup.bash
 ```
 
 Launch:
 
-```text
+```yaml
 ros2 launch hamals_serial_bridge serial_bridge.launch.py
+```
+
+## Ekosistem
+
+Bu paket, HAMALS robot yazılım mimarisinin bir parçasıdır.
+
+Bağlantılı olduğu firmware:
+
+- **[hamals_firmware](https://github.com/m-gnr/hamals_firmware)**  
+  Diferansiyel sürüşlü robot için MCU tabanlı gerçek zamanlı kontrol katmanı.
+
+```
+            ┌────────────────────────────┐
+            │        ROS 2 Layer         │
+            │  Nav2 | EKF | RViz | TF    │
+            └───────────────┬────────────┘
+                            │
+                  hamals_serial_bridge
+                            │
+            ┌───────────────┴────────────┐
+            │       hamals_firmware      │
+            │  PID | IMU | Encoder | Odom│
+            └────────────────────────────┘
 ```
