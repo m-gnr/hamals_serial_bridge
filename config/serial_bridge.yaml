@@ -5,7 +5,7 @@
     timeout_ms: 50
 
     cmd_vel_topic: /cmd_vel
-    odom_topic: /odom_raw
+    odom_topic: /odom
     odom_pub_hz: 50
 
     reset_on_startup: true

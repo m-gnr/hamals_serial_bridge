@@ -34,7 +34,6 @@ class SerialBridgeNode(Node):
 
         self.declare_parameter('cmd_vel_timeout_ms', 500)
 
-        # 🔥 SINGLE DEBUG FLAG
         self.declare_parameter('debug', False)
 
         # ==================== PARAM READ ====================
