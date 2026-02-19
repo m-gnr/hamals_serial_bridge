@@ -5,7 +5,7 @@
     timeout_ms: 50
 
     frame_id: odom
-    child_frame_id: base_link
+    child_frame_id: base_footprint
 
     cmd_vel_topic: /cmd_vel
     odom_topic: /odom

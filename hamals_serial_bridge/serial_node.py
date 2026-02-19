@@ -78,7 +78,7 @@ class SerialBridgeNode(Node):
         self._deadman_active = False
         self._running = True
 
-        # Debug
+        # Debug counters
         self._dbg_tx = 0
         self._dbg_odom = 0
         self._dbg_last_cmd = (0.0, 0.0)
@@ -120,7 +120,34 @@ class SerialBridgeNode(Node):
         )
         self._rx_thread.start()
 
+        self._print_startup_config()
         self.get_logger().info("hamals_serial_bridge started")
+
+    # =====================================================
+    # STARTUP CONFIG PANEL
+    # =====================================================
+    def _print_startup_config(self):
+        panel = f"""
+╔══════════════════════════════════════════════════════╗
+║        HAMALS SERIAL BRIDGE — STARTUP CONFIG         ║
+╠══════════════════════════════════════════════════════╣
+║ Port                : {self.port:<30}║
+║ Baudrate            : {self.baudrate:<30}║
+║ Timeout (ms)        : {self.timeout_ms:<30}║
+╠══════════════════════════════════════════════════════╣
+║ cmd_vel_topic       : {self.cmd_vel_topic:<30}║
+║ odom_topic          : {self.odom_topic:<30}║
+║ odom_pub_hz         : {self.odom_pub_hz:<30}║
+╠══════════════════════════════════════════════════════╣
+║ frame_id            : {self.frame_id:<30}║
+║ child_frame_id      : {self.child_frame_id:<30}║
+╠══════════════════════════════════════════════════════╣
+║ reset_on_startup    : {str(self.reset_on_startup):<30}║
+║ cmd_vel_timeout_ms  : {self.cmd_vel_timeout_ms:<30}║
+║ debug               : {str(self.debug):<30}║
+╚══════════════════════════════════════════════════════╝
+"""
+        self.get_logger().info(panel)
 
     # =====================================================
     # SERIAL SAFE WRITE
@@ -147,7 +174,6 @@ class SerialBridgeNode(Node):
     def _reset_mcu(self):
         if not self.reset_on_startup:
             return
-
         self.get_logger().info("Resetting MCU via DTR")
         self.ser.dtr = False
         time.sleep(self.reset_pulse_ms / 1000.0)
@@ -160,11 +186,9 @@ class SerialBridgeNode(Node):
     def cmd_vel_callback(self, msg: Twist):
         v = msg.linear.x
         w = msg.angular.z
-
         self._last_cmd_time = time.time()
         self._dbg_tx += 1
         self._dbg_last_cmd = (v, w)
-
         self._serial_write(encode_cmd(v, w).encode('utf-8'))
 
     # =====================================================
@@ -173,7 +197,6 @@ class SerialBridgeNode(Node):
     def serial_rx_loop(self):
         while rclpy.ok() and self._running:
             try:
-                # Deadman
                 timeout = (
                     time.time() - self._last_cmd_time
                     > self.cmd_vel_timeout_ms / 1000.0
@@ -194,15 +217,14 @@ class SerialBridgeNode(Node):
                 decoded = raw.decode('utf-8', errors='ignore')
                 messages = self.parser.push(decoded)
 
-                self._dbg_rx_bytes = self.parser.bytes_received
-                self._dbg_rx_frames = self.parser.valid_frames
-                self._dbg_rx_invalid = self.parser.invalid_frames
-
                 for msg in messages:
                     self.handle_serial_message(msg)
 
             except Exception as e:
-                self.get_logger().warn(f"RX error: {e}", throttle_duration_sec=5.0)
+                self.get_logger().warn(
+                    f"RX error: {e}",
+                    throttle_duration_sec=5.0
+                )
                 time.sleep(0.1)
 
     # =====================================================
@@ -246,7 +268,7 @@ class SerialBridgeNode(Node):
         self.odom_pub.publish(odom)
 
     # =====================================================
-    # DEBUG
+    # DEBUG PANEL
     # =====================================================
     def _print_debug_panel(self):
         v, w = self._dbg_last_cmd
@@ -256,9 +278,6 @@ class SerialBridgeNode(Node):
 ╔══════════════════════════════════════════════════════╗
 ║        HAMALS SERIAL BRIDGE — DEBUG PANEL            ║
 ╠══════════════════════════════════════════════════════╣
-║ RX bytes          : {self._dbg_rx_bytes:<30}║
-║ RX valid frames   : {self._dbg_rx_frames:<30}║
-║ RX invalid frames : {self._dbg_rx_invalid:<30}║
 ║ TX packets        : {self._dbg_tx:<30}║
 ║ ODOM published    : {self._dbg_odom:<30}║
 ║ Dead-man active   : {str(self._deadman_active):<30}║
