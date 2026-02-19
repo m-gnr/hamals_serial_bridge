@@ -4,13 +4,34 @@
     baudrate: 115200
     timeout_ms: 50
 
+    frame_id: odom
+    child_frame_id: base_link
+
     cmd_vel_topic: /cmd_vel
     odom_topic: /odom
     odom_pub_hz: 50
+
+    pose_covariance: [
+      0.01, 0, 0, 0, 0, 0,
+      0, 0.01, 0, 0, 0, 0,
+      0, 0, 99999, 0, 0, 0,
+      0, 0, 0, 99999, 0, 0,
+      0, 0, 0, 0, 99999, 0,
+      0, 0, 0, 0, 0, 0.02
+    ]
+
+    twist_covariance: [
+      0.05, 0, 0, 0, 0, 0,
+      0, 0.05, 0, 0, 0, 0,
+      0, 0, 99999, 0, 0, 0,
+      0, 0, 0, 99999, 0, 0,
+      0, 0, 0, 0, 99999, 0,
+      0, 0, 0, 0, 0, 0.1
+    ]
 
     reset_on_startup: true
     reset_pulse_ms: 100
     reset_boot_wait_ms: 1500
 
-    debug: true
+    debug: false
     cmd_vel_timeout_ms: 500

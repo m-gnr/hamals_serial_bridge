@@ -1,27 +1,44 @@
 # hamals_serial_bridge/protocol.py
 
 # ======================================================
+# CHECKSUM
+# ======================================================
+
+def compute_checksum(payload: str) -> int:
+    """
+    XOR checksum of payload (no $, no *).
+    """
+    cs = 0
+    for c in payload:
+        cs ^= ord(c)
+    return cs
+
+
+# ======================================================
 # ROS → MCU
 # ======================================================
+
 def encode_cmd(v: float, w: float) -> str:
     """
-    Encode cmd_vel to MCU protocol.
+    Encode cmd_vel to framed protocol:
 
-    Output:
-      CMD v w\n
+      $CMD,v,w*CS\n
     """
-    return f"CMD {v:.3f} {w:.3f}\n"
+    payload = f"CMD,{v:.3f},{w:.3f}"
+    cs = compute_checksum(payload)
+    return f"${payload}*{cs:02X}\n"
 
 
 # ======================================================
 # MCU → ROS
 # ======================================================
+
 def decode_line(line: str):
     """
-    Decode a single protocol line.
+    Decode framed protocol line.
 
     Expected:
-      odom,x,y,yaw,v,w
+      $ODOM,x,y,yaw,v,w*CS
     """
 
     if not line:
@@ -29,10 +46,31 @@ def decode_line(line: str):
 
     line = line.strip()
 
-    if not line.lower().startswith("odom,"):
+    # Must start with $
+    if not line.startswith("$"):
         return None
 
-    parts = line.split(',')
+    # Split checksum
+    try:
+        body, cs_part = line[1:].split("*")
+    except ValueError:
+        return None
+
+    # Validate checksum
+    try:
+        received_cs = int(cs_part, 16)
+    except ValueError:
+        return None
+
+    calc_cs = compute_checksum(body)
+    if calc_cs != received_cs:
+        return None
+
+    # Parse payload
+    if not body.startswith("ODOM,"):
+        return None
+
+    parts = body.split(",")
     if len(parts) != 6:
         return None
 
