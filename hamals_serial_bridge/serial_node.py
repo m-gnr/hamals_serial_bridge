@@ -72,7 +72,7 @@ class SerialBridgeNode(Node):
 
         # ==================== STATE ====================
         self._odom_pub_period = 1.0 / float(self.odom_pub_hz)
-        self._last_odom_pub_time = 0.0
+        self._last_odom_pub_time = self.get_clock().now().nanoseconds / 1e9
 
         self._last_cmd_time = time.time()
         self._deadman_active = False
@@ -233,11 +233,12 @@ class SerialBridgeNode(Node):
     def handle_serial_message(self, msg: dict):
         if msg.get('type') != 'odom':
             return
-
-        now = time.time()
+    
+        now = self.get_clock().now().nanoseconds / 1e9
+    
         if now - self._last_odom_pub_time < self._odom_pub_period:
             return
-
+    
         self._last_odom_pub_time = now
         self._publish_odom(msg)
 
