@@ -2,6 +2,7 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
@@ -33,7 +34,7 @@ class SerialBridgeNode(Node):
         self.declare_parameter('twist_covariance', [0.0] * 36)
 
         self.declare_parameter('frame_id', 'odom')
-        self.declare_parameter('child_frame_id', 'base_link')
+        self.declare_parameter('child_frame_id', 'base_footprint')
 
         self.declare_parameter('reset_on_startup', True)
         self.declare_parameter('reset_pulse_ms', 100)
@@ -73,6 +74,10 @@ class SerialBridgeNode(Node):
         # ==================== STATE ====================
         self._odom_pub_period = 1.0 / float(self.odom_pub_hz)
         self._last_odom_pub_time = self.get_clock().now().nanoseconds / 1e9
+
+        # MCU measurement time (t_us) -> ROS time offset for header.stamp
+        self._mcu_to_ros_offset_ns = None  # computed on first odom frame
+        self._last_odom_stamp_ns = None    # monotonic guard
 
         self._last_cmd_time = time.time()
         self._deadman_active = False
@@ -233,13 +238,9 @@ class SerialBridgeNode(Node):
     def handle_serial_message(self, msg: dict):
         if msg.get('type') != 'odom':
             return
-    
-        now = self.get_clock().now().nanoseconds / 1e9
-    
-        if now - self._last_odom_pub_time < self._odom_pub_period:
-            return
-    
-        self._last_odom_pub_time = now
+
+        # With measurement-time stamping, do not throttle based on ROS receipt time.
+        # If throttling is ever needed, do it based on msg['t_us'].
         self._publish_odom(msg)
 
     def _publish_odom(self, msg: dict):
@@ -247,7 +248,28 @@ class SerialBridgeNode(Node):
         self._dbg_last_odom = (msg['x'], msg['y'], msg['yaw'])
 
         odom = Odometry()
-        odom.header.stamp = self.get_clock().now().to_msg()
+        # Measurement-time stamping using MCU uptime (t_us)
+        t_us = msg.get('t_us')
+        if t_us is None:
+            # Backward compatibility: fall back to receipt time if timestamp missing
+            odom.header.stamp = self.get_clock().now().to_msg()
+        else:
+            now_ns = self.get_clock().now().nanoseconds
+            mcu_ns = int(t_us) * 1000  # us -> ns
+
+            if self._mcu_to_ros_offset_ns is None:
+                # Compute offset once: ros_time ≈ offset + mcu_time
+                self._mcu_to_ros_offset_ns = now_ns - mcu_ns
+
+            stamp_ns = self._mcu_to_ros_offset_ns + mcu_ns
+
+            # Monotonic guard (TF/SLAM hate time going backwards)
+            if self._last_odom_stamp_ns is not None and stamp_ns <= self._last_odom_stamp_ns:
+                stamp_ns = self._last_odom_stamp_ns + 1
+
+            self._last_odom_stamp_ns = stamp_ns
+            odom.header.stamp = Time(nanoseconds=stamp_ns).to_msg()
+
         odom.header.frame_id = self.frame_id
         odom.child_frame_id = self.child_frame_id
 

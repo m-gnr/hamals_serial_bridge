@@ -38,7 +38,7 @@ def decode_line(line: str):
     Decode framed protocol line.
 
     Expected:
-      $ODOM,x,y,yaw,v,w*CS
+      $ODOM,t_us,x,y,yaw,v,w*CS
     """
 
     if not line:
@@ -71,17 +71,18 @@ def decode_line(line: str):
         return None
 
     parts = body.split(",")
-    if len(parts) != 6:
+    if len(parts) != 7:
         return None
 
     try:
         return {
             "type": "odom",
-            "x": float(parts[1]),
-            "y": float(parts[2]),
-            "yaw": float(parts[3]),
-            "v": float(parts[4]),
-            "w": float(parts[5]),
+            "t_us": int(parts[1]),
+            "x": float(parts[2]),
+            "y": float(parts[3]),
+            "yaw": float(parts[4]),
+            "v": float(parts[5]),
+            "w": float(parts[6]),
         }
     except ValueError:
         return None
