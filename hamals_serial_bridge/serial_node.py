@@ -2,18 +2,18 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.time import Time
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 
 import serial
 import threading
 import time
+import math
 
 from .protocol import encode_cmd
 from .parser import LineParser
-from .utils import yaw_to_quat
 
 
 class SerialBridgeNode(Node):
@@ -27,7 +27,8 @@ class SerialBridgeNode(Node):
         self.declare_parameter('timeout_ms', 50)
 
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
-        self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('odom_topic', '/odom_raw')
+        self.declare_parameter('imu_topic', '/imu/data')
         self.declare_parameter('odom_pub_hz', 50)
 
         self.declare_parameter('pose_covariance', [0.0] * 36)
@@ -35,6 +36,7 @@ class SerialBridgeNode(Node):
 
         self.declare_parameter('frame_id', 'odom')
         self.declare_parameter('child_frame_id', 'base_footprint')
+        self.declare_parameter('imu_frame_id', 'imu_link')
 
         self.declare_parameter('reset_on_startup', True)
         self.declare_parameter('reset_pulse_ms', 100)
@@ -43,6 +45,22 @@ class SerialBridgeNode(Node):
         self.declare_parameter('cmd_vel_timeout_ms', 500)
         self.declare_parameter('debug', False)
 
+        self.declare_parameter('wheel_radius_m', 0.035)
+        self.declare_parameter('track_width_m', 0.18)
+        self.declare_parameter('cpr_left', 3959)
+        self.declare_parameter('cpr_right', 3963)
+
+        # ENC -> /odom_raw dt guard (seconds)
+        self.declare_parameter('enc_dt_max_s', 0.2)
+        self.declare_parameter('enc_dt_min_s', 0.0)
+
+        # IMU covariance (3x3 diag values)
+        self.declare_parameter('imu_ang_vel_cov_diag', [9999.0, 9999.0, 0.005])
+        self.declare_parameter('imu_lin_acc_cov_diag', [0.01, 9999.0, 9999.0])
+
+        # Whether to publish linear acceleration values
+        self.declare_parameter('publish_linear_accel', True)
+
         # ==================== PARAM READ ====================
         self.port = self.get_parameter('port').value
         self.baudrate = self.get_parameter('baudrate').value
@@ -50,6 +68,7 @@ class SerialBridgeNode(Node):
 
         self.cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
+        self.imu_topic = self.get_parameter('imu_topic').value
         self.odom_pub_hz = self.get_parameter('odom_pub_hz').value
 
         self.pose_covariance = self.get_parameter('pose_covariance').value
@@ -57,6 +76,7 @@ class SerialBridgeNode(Node):
 
         self.frame_id = self.get_parameter('frame_id').value
         self.child_frame_id = self.get_parameter('child_frame_id').value
+        self.imu_frame_id = self.get_parameter('imu_frame_id').value
 
         self.reset_on_startup = self.get_parameter('reset_on_startup').value
         self.reset_pulse_ms = self.get_parameter('reset_pulse_ms').value
@@ -65,19 +85,35 @@ class SerialBridgeNode(Node):
         self.cmd_vel_timeout_ms = self.get_parameter('cmd_vel_timeout_ms').value
         self.debug = self.get_parameter('debug').value
 
+        self.wheel_radius_m = self.get_parameter('wheel_radius_m').value
+        self.track_width_m = self.get_parameter('track_width_m').value
+        self.cpr_left = self.get_parameter('cpr_left').value
+        self.cpr_right = self.get_parameter('cpr_right').value
+
+        self.enc_dt_max_s = float(self.get_parameter('enc_dt_max_s').value)
+        self.enc_dt_min_s = float(self.get_parameter('enc_dt_min_s').value)
+
+        self.imu_ang_vel_cov_diag = self.get_parameter('imu_ang_vel_cov_diag').value
+        self.imu_lin_acc_cov_diag = self.get_parameter('imu_lin_acc_cov_diag').value
+
+        self.publish_linear_accel = bool(self.get_parameter('publish_linear_accel').value)
+
         if len(self.pose_covariance) != 36:
             raise ValueError("pose_covariance must contain 36 elements")
 
         if len(self.twist_covariance) != 36:
             raise ValueError("twist_covariance must contain 36 elements")
 
+        if len(self.imu_ang_vel_cov_diag) != 3:
+            raise ValueError("imu_ang_vel_cov_diag must contain 3 elements")
+        if len(self.imu_lin_acc_cov_diag) != 3:
+            raise ValueError("imu_lin_acc_cov_diag must contain 3 elements")
+
         # ==================== STATE ====================
         self._odom_pub_period = 1.0 / float(self.odom_pub_hz)
         self._last_odom_pub_time = self.get_clock().now().nanoseconds / 1e9
 
-        # MCU measurement time (t_us) -> ROS time offset for header.stamp
-        self._mcu_to_ros_offset_ns = None  # computed on first odom frame
-        self._last_odom_stamp_ns = None    # monotonic guard
+        self._last_enc_time_s = None
 
         self._last_cmd_time = time.time()
         self._deadman_active = False
@@ -87,7 +123,7 @@ class SerialBridgeNode(Node):
         self._dbg_tx = 0
         self._dbg_odom = 0
         self._dbg_last_cmd = (0.0, 0.0)
-        self._dbg_last_odom = (0.0, 0.0, 0.0)
+        self._dbg_last_odom = (0.0, 0.0)
 
         self._dbg_rx_bytes = 0
         self._dbg_rx_frames = 0
@@ -113,6 +149,12 @@ class SerialBridgeNode(Node):
         self.odom_pub = self.create_publisher(
             Odometry,
             self.odom_topic,
+            10
+        )
+
+        self.imu_pub = self.create_publisher(
+            Imu,
+            self.imu_topic,
             10
         )
 
@@ -142,10 +184,23 @@ class SerialBridgeNode(Node):
 ╠══════════════════════════════════════════════════════╣
 ║ cmd_vel_topic       : {self.cmd_vel_topic:<30}║
 ║ odom_topic          : {self.odom_topic:<30}║
+║ imu_topic           : {self.imu_topic:<30}║
 ║ odom_pub_hz         : {self.odom_pub_hz:<30}║
 ╠══════════════════════════════════════════════════════╣
 ║ frame_id            : {self.frame_id:<30}║
 ║ child_frame_id      : {self.child_frame_id:<30}║
+║ imu_frame_id        : {self.imu_frame_id:<30}║
+╠══════════════════════════════════════════════════════╣
+║ wheel_radius_m      : {self.wheel_radius_m:<30}║
+║ track_width_m       : {self.track_width_m:<30}║
+║ cpr_left            : {self.cpr_left:<30}║
+║ cpr_right           : {self.cpr_right:<30}║
+╠══════════════════════════════════════════════════════╣
+║ enc_dt_max_s        : {self.enc_dt_max_s:<30}║
+║ enc_dt_min_s        : {self.enc_dt_min_s:<30}║
+║ publish_linear_accel: {str(self.publish_linear_accel):<30}║
+║ imu_ang_vel_cov_diag: {str(self.imu_ang_vel_cov_diag):<30}║
+║ imu_lin_acc_cov_diag: {str(self.imu_lin_acc_cov_diag):<30}║
 ╠══════════════════════════════════════════════════════╣
 ║ reset_on_startup    : {str(self.reset_on_startup):<30}║
 ║ cmd_vel_timeout_ms  : {self.cmd_vel_timeout_ms:<30}║
@@ -233,60 +288,139 @@ class SerialBridgeNode(Node):
                 time.sleep(0.1)
 
     # =====================================================
-    # ODOM
+    # MESSAGE HANDLING
     # =====================================================
     def handle_serial_message(self, msg: dict):
-        if msg.get('type') != 'odom':
+        t = msg.get('type')
+        if t == 'enc':
+            self._publish_odom_raw_from_enc(msg)
+        elif t == 'imu':
+            self._publish_imu(msg)
+        elif t == 'odom':
+            self._publish_odom_legacy(msg)
+        else:
             return
 
-        # With measurement-time stamping, do not throttle based on ROS receipt time.
-        # If throttling is ever needed, do it based on msg['t_us'].
-        self._publish_odom(msg)
+    # =====================================================
+    # ENC → /odom_raw
+    # =====================================================
+    def _publish_odom_raw_from_enc(self, msg: dict):
+        now_s = self.get_clock().now().nanoseconds / 1e9
 
-    def _publish_odom(self, msg: dict):
-        self._dbg_odom += 1
-        self._dbg_last_odom = (msg['x'], msg['y'], msg['yaw'])
+        if self._last_enc_time_s is None:
+            self._last_enc_time_s = now_s
+            return
+
+        dt = now_s - self._last_enc_time_s
+        self._last_enc_time_s = now_s
+
+        if dt <= self.enc_dt_min_s or dt > self.enc_dt_max_s:
+            return
+
+        dl = msg.get('dl', 0)
+        dr = msg.get('dr', 0)
+
+        dtheta_l = (2.0 * math.pi * dl) / self.cpr_left
+        dtheta_r = (2.0 * math.pi * dr) / self.cpr_right
+
+        omega_l = dtheta_l / dt
+        omega_r = dtheta_r / dt
+
+        v_l = omega_l * self.wheel_radius_m
+        v_r = omega_r * self.wheel_radius_m
+
+        v = 0.5 * (v_l + v_r)
+        w = (v_r - v_l) / self.track_width_m
 
         odom = Odometry()
-        # Measurement-time stamping using MCU uptime (t_us)
-        t_us = msg.get('t_us')
-        if t_us is None:
-            # Backward compatibility: fall back to receipt time if timestamp missing
-            odom.header.stamp = self.get_clock().now().to_msg()
-        else:
-            now_ns = self.get_clock().now().nanoseconds
-            mcu_ns = int(t_us) * 1000  # us -> ns
-
-            if self._mcu_to_ros_offset_ns is None:
-                # Compute offset once: ros_time ≈ offset + mcu_time
-                self._mcu_to_ros_offset_ns = now_ns - mcu_ns
-
-            stamp_ns = self._mcu_to_ros_offset_ns + mcu_ns
-
-            # Monotonic guard (TF/SLAM hate time going backwards)
-            if self._last_odom_stamp_ns is not None and stamp_ns <= self._last_odom_stamp_ns:
-                stamp_ns = self._last_odom_stamp_ns + 1
-
-            self._last_odom_stamp_ns = stamp_ns
-            odom.header.stamp = Time(nanoseconds=stamp_ns).to_msg()
-
+        odom.header.stamp = self.get_clock().now().to_msg()
         odom.header.frame_id = self.frame_id
         odom.child_frame_id = self.child_frame_id
 
-        odom.pose.pose.position.x = msg['x']
-        odom.pose.pose.position.y = msg['y']
+        odom.pose.pose.position.x = 0.0
+        odom.pose.pose.position.y = 0.0
+        odom.pose.pose.position.z = 0.0
 
-        qx, qy, qz, qw = yaw_to_quat(msg['yaw'])
-        odom.pose.pose.orientation.x = qx
-        odom.pose.pose.orientation.y = qy
-        odom.pose.pose.orientation.z = qz
-        odom.pose.pose.orientation.w = qw
+        odom.pose.pose.orientation.x = 0.0
+        odom.pose.pose.orientation.y = 0.0
+        odom.pose.pose.orientation.z = 0.0
+        odom.pose.pose.orientation.w = 1.0
 
         odom.pose.covariance = self.pose_covariance
         odom.twist.covariance = self.twist_covariance
 
-        odom.twist.twist.linear.x = msg['v']
-        odom.twist.twist.angular.z = msg['w']
+        odom.twist.twist.linear.x = v
+        odom.twist.twist.angular.z = w
+
+        self.odom_pub.publish(odom)
+
+        self._dbg_odom += 1
+        self._dbg_last_odom = (v, w)
+
+    # =====================================================
+    # IMU → /imu/data
+    # =====================================================
+    def _publish_imu(self, msg: dict):
+        imu_msg = Imu()
+        imu_msg.header.stamp = self.get_clock().now().to_msg()
+        imu_msg.header.frame_id = self.imu_frame_id
+
+        imu_msg.orientation_covariance[0] = -1.0
+
+        imu_msg.angular_velocity.x = 0.0
+        imu_msg.angular_velocity.y = 0.0
+        imu_msg.angular_velocity.z = msg.get('gz', 0.0)
+
+        imu_msg.angular_velocity_covariance = [
+            float(self.imu_ang_vel_cov_diag[0]), 0.0, 0.0,
+            0.0, float(self.imu_ang_vel_cov_diag[1]), 0.0,
+            0.0, 0.0, float(self.imu_ang_vel_cov_diag[2])
+        ]
+
+        if self.publish_linear_accel:
+            imu_msg.linear_acceleration.x = msg.get('ax', 0.0)
+            imu_msg.linear_acceleration.y = msg.get('ay', 0.0)
+            imu_msg.linear_acceleration.z = msg.get('az', 0.0)
+        else:
+            imu_msg.linear_acceleration.x = 0.0
+            imu_msg.linear_acceleration.y = 0.0
+            imu_msg.linear_acceleration.z = 0.0
+
+        imu_msg.linear_acceleration_covariance = [
+            float(self.imu_lin_acc_cov_diag[0]), 0.0, 0.0,
+            0.0, float(self.imu_lin_acc_cov_diag[1]), 0.0,
+            0.0, 0.0, float(self.imu_lin_acc_cov_diag[2])
+        ]
+
+        self.imu_pub.publish(imu_msg)
+
+    # =====================================================
+    # LEGACY ODOM SUPPORT
+    # =====================================================
+    def _publish_odom_legacy(self, msg: dict):
+        self._dbg_odom += 1
+        self._dbg_last_odom = (0.0, 0.0)
+
+        odom = Odometry()
+        odom.header.stamp = self.get_clock().now().to_msg()
+        odom.header.frame_id = self.frame_id
+        odom.child_frame_id = self.child_frame_id
+
+        odom.pose.pose.position.x = msg.get('x', 0.0)
+        odom.pose.pose.position.y = msg.get('y', 0.0)
+        odom.pose.pose.position.z = 0.0
+
+        # Orientation identity (legacy: no yaw_to_quat)
+        odom.pose.pose.orientation.x = 0.0
+        odom.pose.pose.orientation.y = 0.0
+        odom.pose.pose.orientation.z = 0.0
+        odom.pose.pose.orientation.w = 1.0
+
+        odom.pose.covariance = self.pose_covariance
+        odom.twist.covariance = self.twist_covariance
+
+        odom.twist.twist.linear.x = msg.get('v', 0.0)
+        odom.twist.twist.angular.z = msg.get('w', 0.0)
 
         self.odom_pub.publish(odom)
 
@@ -295,7 +429,7 @@ class SerialBridgeNode(Node):
     # =====================================================
     def _print_debug_panel(self):
         v, w = self._dbg_last_cmd
-        x, y, yaw = self._dbg_last_odom
+        odom_v, odom_w = self._dbg_last_odom
 
         panel = f"""
 ╔══════════════════════════════════════════════════════╗
@@ -306,7 +440,7 @@ class SerialBridgeNode(Node):
 ║ Dead-man active   : {str(self._deadman_active):<30}║
 ╠══════════════════════════════════════════════════════╣
 ║ Last cmd_vel      : v={v:.2f}  w={w:.2f}              ║
-║ Last odom         : x={x:.2f} y={y:.2f} yaw={yaw:.2f} ║
+║ Last odom_raw twist : v={odom_v:.2f} w={odom_w:.2f}    ║
 ╚══════════════════════════════════════════════════════╝
 """
         self.get_logger().info(panel)

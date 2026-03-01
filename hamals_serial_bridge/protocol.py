@@ -38,7 +38,9 @@ def decode_line(line: str):
     Decode framed protocol line.
 
     Expected:
-      $ODOM,t_us,x,y,yaw,v,w*CS
+      $ENC,t_us,dl,dr*CS
+      $IMU,t_us,gz,ax,ay,az*CS
+      $ODOM,t_us,x,y,yaw,v,w*CS (legacy)
     """
 
     if not line:
@@ -67,22 +69,35 @@ def decode_line(line: str):
         return None
 
     # Parse payload
-    if not body.startswith("ODOM,"):
-        return None
-
     parts = body.split(",")
-    if len(parts) != 7:
-        return None
-
     try:
-        return {
-            "type": "odom",
-            "t_us": int(parts[1]),
-            "x": float(parts[2]),
-            "y": float(parts[3]),
-            "yaw": float(parts[4]),
-            "v": float(parts[5]),
-            "w": float(parts[6]),
-        }
+        if parts[0] == "ENC" and len(parts) == 4:
+            return {
+                "type": "enc",
+                "t_us": int(parts[1]),
+                "dl": int(parts[2]),
+                "dr": int(parts[3]),
+            }
+        elif parts[0] == "IMU" and len(parts) == 6:
+            return {
+                "type": "imu",
+                "t_us": int(parts[1]),
+                "gz": float(parts[2]),
+                "ax": float(parts[3]),
+                "ay": float(parts[4]),
+                "az": float(parts[5]),
+            }
+        elif parts[0] == "ODOM" and len(parts) == 7:
+            return {
+                "type": "odom",
+                "t_us": int(parts[1]),
+                "x": float(parts[2]),
+                "y": float(parts[3]),
+                "yaw": float(parts[4]),
+                "v": float(parts[5]),
+                "w": float(parts[6]),
+            }
+        else:
+            return None
     except ValueError:
         return None
