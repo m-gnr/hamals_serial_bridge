@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
     port: /dev/ttyACM0
-    baudrate: 115200
+    baudrate: 230400
     timeout_ms: 50
 
     frame_id: odom
@@ -14,14 +14,14 @@
     imu_topic: /imu/data
     odom_pub_hz: 50
 
-    wheel_radius_m: 0.035
+    wheel_radius_m: 0.03729
     track_width_m: 0.18
     cpr_left: 3959
     cpr_right: 3963
 
     # ENC dt guard (seconds)
     enc_dt_min_s: 0.0
-    enc_dt_max_s: 0.2
+    enc_dt_max_s: 0.5
 
     # IMU publish options
     publish_linear_accel: true

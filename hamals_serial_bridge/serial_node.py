@@ -50,15 +50,12 @@ class SerialBridgeNode(Node):
         self.declare_parameter('cpr_left', 3959)
         self.declare_parameter('cpr_right', 3963)
 
-        # ENC -> /odom_raw dt guard (seconds)
-        self.declare_parameter('enc_dt_max_s', 0.2)
+        self.declare_parameter('enc_dt_max_s', 0.5)
         self.declare_parameter('enc_dt_min_s', 0.0)
 
-        # IMU covariance (3x3 diag values)
         self.declare_parameter('imu_ang_vel_cov_diag', [9999.0, 9999.0, 0.005])
         self.declare_parameter('imu_lin_acc_cov_diag', [0.01, 9999.0, 9999.0])
 
-        # Whether to publish linear acceleration values
         self.declare_parameter('publish_linear_accel', True)
 
         # ==================== PARAM READ ====================
@@ -100,10 +97,8 @@ class SerialBridgeNode(Node):
 
         if len(self.pose_covariance) != 36:
             raise ValueError("pose_covariance must contain 36 elements")
-
         if len(self.twist_covariance) != 36:
             raise ValueError("twist_covariance must contain 36 elements")
-
         if len(self.imu_ang_vel_cov_diag) != 3:
             raise ValueError("imu_ang_vel_cov_diag must contain 3 elements")
         if len(self.imu_lin_acc_cov_diag) != 3:
@@ -112,19 +107,15 @@ class SerialBridgeNode(Node):
         # ==================== STATE ====================
         self._odom_pub_period = 1.0 / float(self.odom_pub_hz)
         self._last_odom_pub_time = self.get_clock().now().nanoseconds / 1e9
-
         self._last_enc_time_s = None
-
         self._last_cmd_time = time.time()
         self._deadman_active = False
         self._running = True
 
-        # Debug counters
         self._dbg_tx = 0
         self._dbg_odom = 0
         self._dbg_last_cmd = (0.0, 0.0)
         self._dbg_last_odom = (0.0, 0.0)
-
         self._dbg_rx_bytes = 0
         self._dbg_rx_frames = 0
         self._dbg_rx_invalid = 0
@@ -270,15 +261,25 @@ class SerialBridgeNode(Node):
                 elif not timeout:
                     self._deadman_active = False
 
-                raw = self.ser.read(128)
+                # İlk satırı oku
+                raw = self.ser.read_until(b'\n', size=256)
                 if not raw:
                     continue
 
                 decoded = raw.decode('utf-8', errors='ignore')
                 messages = self.parser.push(decoded)
-
                 for msg in messages:
                     self.handle_serial_message(msg)
+
+                # Bekleyen daha fazla veri varsa hemen işle
+                while self.ser.in_waiting > 0:
+                    raw2 = self.ser.read_until(b'\n', size=256)
+                    if not raw2:
+                        break
+                    decoded2 = raw2.decode('utf-8', errors='ignore')
+                    messages2 = self.parser.push(decoded2)
+                    for msg2 in messages2:
+                        self.handle_serial_message(msg2)
 
             except Exception as e:
                 self.get_logger().warn(
@@ -298,8 +299,6 @@ class SerialBridgeNode(Node):
             self._publish_imu(msg)
         elif t == 'odom':
             self._publish_odom_legacy(msg)
-        else:
-            return
 
     # =====================================================
     # ENC → /odom_raw
@@ -410,7 +409,6 @@ class SerialBridgeNode(Node):
         odom.pose.pose.position.y = msg.get('y', 0.0)
         odom.pose.pose.position.z = 0.0
 
-        # Orientation identity (legacy: no yaw_to_quat)
         odom.pose.pose.orientation.x = 0.0
         odom.pose.pose.orientation.y = 0.0
         odom.pose.pose.orientation.z = 0.0
