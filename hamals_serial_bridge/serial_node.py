@@ -29,7 +29,6 @@ class SerialBridgeNode(Node):
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('odom_topic', '/odom_raw')
         self.declare_parameter('imu_topic', '/imu/data')
-        self.declare_parameter('odom_pub_hz', 50)
 
         self.declare_parameter('pose_covariance', [0.0] * 36)
         self.declare_parameter('twist_covariance', [0.0] * 36)
@@ -43,7 +42,13 @@ class SerialBridgeNode(Node):
         self.declare_parameter('reset_boot_wait_ms', 1500)
 
         self.declare_parameter('cmd_vel_timeout_ms', 500)
+        self.declare_parameter('cmd_vel_rate_limit_hz', 50)
         self.declare_parameter('debug', False)
+
+        self.declare_parameter('cmd_dedup_enabled', True)
+        self.declare_parameter('cmd_dedup_eps_v', 0.01)
+        self.declare_parameter('cmd_dedup_eps_w', 0.02)
+        self.declare_parameter('cmd_force_resend_ms', 300)
 
         self.declare_parameter('wheel_radius_m', 0.035)
         self.declare_parameter('track_width_m', 0.18)
@@ -66,7 +71,6 @@ class SerialBridgeNode(Node):
         self.cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
         self.imu_topic = self.get_parameter('imu_topic').value
-        self.odom_pub_hz = self.get_parameter('odom_pub_hz').value
 
         self.pose_covariance = self.get_parameter('pose_covariance').value
         self.twist_covariance = self.get_parameter('twist_covariance').value
@@ -80,7 +84,13 @@ class SerialBridgeNode(Node):
         self.reset_boot_wait_ms = self.get_parameter('reset_boot_wait_ms').value
 
         self.cmd_vel_timeout_ms = self.get_parameter('cmd_vel_timeout_ms').value
+        self.cmd_vel_rate_limit_hz = self.get_parameter('cmd_vel_rate_limit_hz').value
         self.debug = self.get_parameter('debug').value
+
+        self.cmd_dedup_enabled = bool(self.get_parameter('cmd_dedup_enabled').value)
+        self.cmd_dedup_eps_v = float(self.get_parameter('cmd_dedup_eps_v').value)
+        self.cmd_dedup_eps_w = float(self.get_parameter('cmd_dedup_eps_w').value)
+        self.cmd_force_resend_ms = int(self.get_parameter('cmd_force_resend_ms').value)
 
         self.wheel_radius_m = self.get_parameter('wheel_radius_m').value
         self.track_width_m = self.get_parameter('track_width_m').value
@@ -105,14 +115,20 @@ class SerialBridgeNode(Node):
             raise ValueError("imu_lin_acc_cov_diag must contain 3 elements")
 
         # ==================== STATE ====================
-        self._odom_pub_period = 1.0 / float(self.odom_pub_hz)
-        self._last_odom_pub_time = self.get_clock().now().nanoseconds / 1e9
         self._last_enc_time_s = None
         self._last_cmd_time = time.time()
+        self._last_cmd_send_time = 0.0
+        self._cmd_send_min_interval = 1.0 / float(self.cmd_vel_rate_limit_hz) if self.cmd_vel_rate_limit_hz > 0 else 0.0
         self._deadman_active = False
         self._running = True
 
+        self._last_sent_cmd_v = None
+        self._last_sent_cmd_w = None
+        self._last_sent_cmd_time = 0.0
+
         self._dbg_tx = 0
+        self._dbg_tx_skipped_dedup = 0
+        self._dbg_tx_skipped_ratelimit = 0
         self._dbg_odom = 0
         self._dbg_last_cmd = (0.0, 0.0)
         self._dbg_last_odom = (0.0, 0.0)
@@ -152,6 +168,9 @@ class SerialBridgeNode(Node):
         if self.debug:
             self.create_timer(1.0, self._print_debug_panel)
 
+        # Timeout kontrolü için timer (50ms periyot)
+        self.create_timer(0.05, self._check_cmd_timeout)
+
         self._rx_thread = threading.Thread(
             target=self.serial_rx_loop,
             daemon=True
@@ -176,7 +195,6 @@ class SerialBridgeNode(Node):
 ║ cmd_vel_topic       : {self.cmd_vel_topic:<30}║
 ║ odom_topic          : {self.odom_topic:<30}║
 ║ imu_topic           : {self.imu_topic:<30}║
-║ odom_pub_hz         : {self.odom_pub_hz:<30}║
 ╠══════════════════════════════════════════════════════╣
 ║ frame_id            : {self.frame_id:<30}║
 ║ child_frame_id      : {self.child_frame_id:<30}║
@@ -195,6 +213,11 @@ class SerialBridgeNode(Node):
 ╠══════════════════════════════════════════════════════╣
 ║ reset_on_startup    : {str(self.reset_on_startup):<30}║
 ║ cmd_vel_timeout_ms  : {self.cmd_vel_timeout_ms:<30}║
+║ cmd_vel_rate_limit  : {self.cmd_vel_rate_limit_hz:<30}║
+║ dedup_enabled       : {str(self.cmd_dedup_enabled):<30}║
+║ dedup_eps_v         : {self.cmd_dedup_eps_v:<30}║
+║ dedup_eps_w         : {self.cmd_dedup_eps_w:<30}║
+║ force_resend_ms     : {self.cmd_force_resend_ms:<30}║
 ║ debug               : {str(self.debug):<30}║
 ╚══════════════════════════════════════════════════════╝
 """
@@ -203,11 +226,17 @@ class SerialBridgeNode(Node):
     # =====================================================
     # SERIAL SAFE WRITE
     # =====================================================
-    def _serial_write(self, data: bytes):
-        if not self.ser:
-            return
-        with self._tx_lock:
-            self.ser.write(data)
+    def _serial_write(self, data: bytes) -> bool:
+        """Serial'e yaz. Başarılıysa True, değilse False döner."""
+        if not self.ser or not self.ser.is_open:
+            return False
+        try:
+            with self._tx_lock:
+                self.ser.write(data)
+            return True
+        except Exception as e:
+            self.get_logger().warn(f"Serial write error: {e}", throttle_duration_sec=5.0)
+            return False
 
     # =====================================================
     # SERIAL CONNECT
@@ -232,15 +261,107 @@ class SerialBridgeNode(Node):
         time.sleep(self.reset_boot_wait_ms / 1000.0)
 
     # =====================================================
+    # CMD HELPERS
+    # =====================================================
+    def _is_stop_cmd(self, v: float, w: float) -> bool:
+        return abs(v) < 1e-6 and abs(w) < 1e-6
+
+    def _send_cmd(self, v: float, w: float) -> bool:
+        """cmd_vel gönder. Sadece başarılı yazımda state günceller."""
+        if self._serial_write(encode_cmd(v, w).encode('utf-8')):
+            self._dbg_tx += 1
+            self._last_sent_cmd_v = v
+            self._last_sent_cmd_w = w
+            self._last_sent_cmd_time = time.time()
+            return True
+        return False
+
+    def _maybe_send_cmd(self, v: float, w: float, force: bool = False):
+        now = time.time()
+
+        # 1. Force komutu → her zaman gönder
+        if force:
+            if self._send_cmd(v, w):
+                self._last_cmd_send_time = now
+            return
+
+        # 2. İlk komut → her zaman gönder
+        if self._last_sent_cmd_v is None or self._last_sent_cmd_w is None:
+            if self._send_cmd(v, w):
+                self._last_cmd_send_time = now
+            return
+
+        # 3. Kritik geçişler: stop <-> hareket → her zaman gönder (rate limit'e bakmadan)
+        prev_stop = self._is_stop_cmd(self._last_sent_cmd_v, self._last_sent_cmd_w)
+        new_stop = self._is_stop_cmd(v, w)
+        if prev_stop != new_stop:
+            if self._send_cmd(v, w):
+                self._last_cmd_send_time = now
+            return
+
+        # 4. Dedup kapalıysa normal gönder (rate limit'e tabi)
+        if not self.cmd_dedup_enabled:
+            # Rate limiting kontrolü
+            if self._cmd_send_min_interval > 0:
+                time_since_last = now - self._last_cmd_send_time
+                if time_since_last < self._cmd_send_min_interval:
+                    self._dbg_tx_skipped_ratelimit += 1
+                    return
+            if self._send_cmd(v, w):
+                self._last_cmd_send_time = now
+            return
+
+        # 5. Değişim kontrolü
+        dv = abs(v - self._last_sent_cmd_v)
+        dw = abs(w - self._last_sent_cmd_w)
+        changed = (dv > self.cmd_dedup_eps_v) or (dw > self.cmd_dedup_eps_w)
+
+        if changed:
+            # Değişim var → rate limit kontrolü yap
+            if self._cmd_send_min_interval > 0:
+                time_since_last = now - self._last_cmd_send_time
+                if time_since_last < self._cmd_send_min_interval:
+                    self._dbg_tx_skipped_ratelimit += 1
+                    return
+            if self._send_cmd(v, w):
+                self._last_cmd_send_time = now
+        else:
+            # Değişim yok → force resend kontrolü
+            resend_due = (now - self._last_sent_cmd_time) * 1000.0 >= self.cmd_force_resend_ms
+            if resend_due:
+                # Force resend → rate limit'e bakmadan gönder (zaten 300ms seyrek)
+                if self._send_cmd(v, w):
+                    self._last_cmd_send_time = now
+            else:
+                self._dbg_tx_skipped_dedup += 1
+
+    # =====================================================
+    # TIMEOUT CHECKER
+    # =====================================================
+    def _check_cmd_timeout(self):
+        """Periyodik olarak cmd_vel timeout kontrolü yapar."""
+        timeout = (
+            time.time() - self._last_cmd_time
+            > self.cmd_vel_timeout_ms / 1000.0
+        )
+
+        if timeout and not self._deadman_active:
+            self._maybe_send_cmd(0.0, 0.0, force=True)
+            self._deadman_active = True
+        elif not timeout:
+            self._deadman_active = False
+
+    # =====================================================
     # ROS → MCU
     # =====================================================
     def cmd_vel_callback(self, msg: Twist):
         v = msg.linear.x
         w = msg.angular.z
+
         self._last_cmd_time = time.time()
-        self._dbg_tx += 1
         self._dbg_last_cmd = (v, w)
-        self._serial_write(encode_cmd(v, w).encode('utf-8'))
+
+        self._maybe_send_cmd(v, w, force=False)
 
     # =====================================================
     # MCU → ROS
@@ -248,20 +369,6 @@ class SerialBridgeNode(Node):
     def serial_rx_loop(self):
         while rclpy.ok() and self._running:
             try:
-                timeout = (
-                    time.time() - self._last_cmd_time
-                    > self.cmd_vel_timeout_ms / 1000.0
-                )
-
-                if timeout and not self._deadman_active:
-                    self._serial_write(
-                        encode_cmd(0.0, 0.0).encode('utf-8')
-                    )
-                    self._deadman_active = True
-                elif not timeout:
-                    self._deadman_active = False
-
-                # İlk satırı oku
                 raw = self.ser.read_until(b'\n', size=256)
                 if not raw:
                     continue
@@ -271,15 +378,23 @@ class SerialBridgeNode(Node):
                 for msg in messages:
                     self.handle_serial_message(msg)
 
-                # Bekleyen daha fazla veri varsa hemen işle
+                self._dbg_rx_bytes = self.parser.bytes_received
+                self._dbg_rx_frames = self.parser.valid_frames
+                self._dbg_rx_invalid = self.parser.invalid_frames
+
                 while self.ser.in_waiting > 0:
                     raw2 = self.ser.read_until(b'\n', size=256)
                     if not raw2:
                         break
+
                     decoded2 = raw2.decode('utf-8', errors='ignore')
                     messages2 = self.parser.push(decoded2)
                     for msg2 in messages2:
                         self.handle_serial_message(msg2)
+
+                    self._dbg_rx_bytes = self.parser.bytes_received
+                    self._dbg_rx_frames = self.parser.valid_frames
+                    self._dbg_rx_invalid = self.parser.invalid_frames
 
             except Exception as e:
                 self.get_logger().warn(
@@ -297,8 +412,6 @@ class SerialBridgeNode(Node):
             self._publish_odom_raw_from_enc(msg)
         elif t == 'imu':
             self._publish_imu(msg)
-        elif t == 'odom':
-            self._publish_odom_legacy(msg)
 
     # =====================================================
     # ENC → /odom_raw
@@ -394,35 +507,6 @@ class SerialBridgeNode(Node):
         self.imu_pub.publish(imu_msg)
 
     # =====================================================
-    # LEGACY ODOM SUPPORT
-    # =====================================================
-    def _publish_odom_legacy(self, msg: dict):
-        self._dbg_odom += 1
-        self._dbg_last_odom = (0.0, 0.0)
-
-        odom = Odometry()
-        odom.header.stamp = self.get_clock().now().to_msg()
-        odom.header.frame_id = self.frame_id
-        odom.child_frame_id = self.child_frame_id
-
-        odom.pose.pose.position.x = msg.get('x', 0.0)
-        odom.pose.pose.position.y = msg.get('y', 0.0)
-        odom.pose.pose.position.z = 0.0
-
-        odom.pose.pose.orientation.x = 0.0
-        odom.pose.pose.orientation.y = 0.0
-        odom.pose.pose.orientation.z = 0.0
-        odom.pose.pose.orientation.w = 1.0
-
-        odom.pose.covariance = self.pose_covariance
-        odom.twist.covariance = self.twist_covariance
-
-        odom.twist.twist.linear.x = msg.get('v', 0.0)
-        odom.twist.twist.angular.z = msg.get('w', 0.0)
-
-        self.odom_pub.publish(odom)
-
-    # =====================================================
     # DEBUG PANEL
     # =====================================================
     def _print_debug_panel(self):
@@ -434,7 +518,12 @@ class SerialBridgeNode(Node):
 ║        HAMALS SERIAL BRIDGE — DEBUG PANEL            ║
 ╠══════════════════════════════════════════════════════╣
 ║ TX packets        : {self._dbg_tx:<30}║
+║ TX dedup skipped  : {self._dbg_tx_skipped_dedup:<30}║
+║ TX ratelimit skip : {self._dbg_tx_skipped_ratelimit:<30}║
 ║ ODOM published    : {self._dbg_odom:<30}║
+║ RX bytes          : {self._dbg_rx_bytes:<30}║
+║ RX valid frames   : {self._dbg_rx_frames:<30}║
+║ RX invalid frames : {self._dbg_rx_invalid:<30}║
 ║ Dead-man active   : {str(self._deadman_active):<30}║
 ╠══════════════════════════════════════════════════════╣
 ║ Last cmd_vel      : v={v:.2f}  w={w:.2f}              ║

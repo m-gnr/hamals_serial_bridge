@@ -12,7 +12,6 @@
     cmd_vel_topic: /cmd_vel
     odom_topic: /odom_raw
     imu_topic: /imu/data
-    odom_pub_hz: 50
 
     wheel_radius_m: 0.03729
     track_width_m: 0.18
@@ -53,4 +52,12 @@
     reset_boot_wait_ms: 1500
 
     debug: false
+
+    # cmd_vel politikası
     cmd_vel_timeout_ms: 500
+    cmd_vel_rate_limit_hz: 10
+
+    cmd_dedup_enabled: true
+    cmd_dedup_eps_v: 0.02
+    cmd_dedup_eps_w: 0.05
+    cmd_force_resend_ms: 300
